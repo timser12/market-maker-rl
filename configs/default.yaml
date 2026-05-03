@@ -1,0 +1,16 @@
+symbol: BTCUSDT
+tick_size: "0.01"
+step_size: "0.00001"
+depth_limit: 1000
+levels: 200
+history: 16
+window_ms: 1000
+maker_fee_bps: 1.0
+max_inventory: 0.02
+max_drawdown_quote: 100.0
+min_spread_ticks: 1
+max_staleness_ms: 2500
+max_order_size: 0.002
+base_order_size: 0.001
+latency_min_ms: 50
+latency_max_ms: 250

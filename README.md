@@ -1,0 +1,128 @@
+# Market-Making RL Bot — Simulation-First Research Scaffold
+
+This is a simulation-first market-making research system. It is **not** a live-trading bot. If you wire this directly to an exchange before proving the simulator, risk layer, and data pipeline, you deserve the resulting tuition bill.
+
+## What is included
+
+- Binance public market-data client for depth, `aggTrade`, and kline streams.
+- Strict local order book reconstruction semantics using `U/u` update IDs.
+- Fixed-point price and quantity representation using tick/step sizes.
+- Rolling trade-volume-by-price buckets from `aggTrade` events.
+- Order book tensor builder with depth, log quantity, cumulative depth, imbalance, deltas, and executed volume channels.
+- Conservative queue-aware fill simulator with random latency.
+- Portfolio, PnL, fees, inventory, and risk manager.
+- Gymnasium-style RL environment with a 9-action discrete action space.
+- CNN/Dueling-DQN network skeleton.
+- Hardcoded inventory-skew baseline strategy.
+- Tests for order-book sequencing, queue fills, and risk blocking.
+
+## Install
+
+```bash
+cd market_making_rl_bot
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .[dev]
+```
+
+## Run tests
+
+```bash
+pytest
+```
+
+## Create and run a toy replay
+
+```bash
+python -m mmrl.scripts.make_toy_replay
+python -m mmrl.scripts.run_env_smoke
+```
+
+## Collect Binance public market data
+
+```bash
+python -m mmrl.scripts.collect_data --config configs/default.yaml --out data/raw/events.jsonl --max-events 10000
+```
+
+The collector writes a snapshot plus market events to JSONL. Use this for offline paper simulations. Do not place live orders from this scaffold.
+
+## Architecture
+
+```text
+Binance streams
+    ├── depth diff stream
+    ├── aggTrade stream
+    └── kline stream
+        ↓
+Market data service
+    ├── local order book
+    ├── trade classifier
+    ├── trade buckets
+    └── snapshot/event store
+        ↓
+RL environment
+    ├── observation builder
+    ├── conservative fill simulator
+    ├── reward function
+    └── risk manager
+        ↓
+Agent
+    ├── CNN order-book encoder
+    ├── portfolio-state encoder
+    └── Dueling-DQN policy head
+        ↓
+Action proposal
+        ↓
+Risk override layer
+        ↓
+Paper execution engine
+```
+
+## Observation design
+
+The current order-book observation shape is:
+
+```text
+[channels, time, levels]
+```
+
+Channels:
+
+1. bid quantity
+2. ask quantity
+3. log bid quantity
+4. log ask quantity
+5. cumulative bid quantity
+6. cumulative ask quantity
+7. level imbalance
+8. distance from top level
+9. bid log-quantity delta
+10. ask log-quantity delta
+11. executed aggressive buy volume at ask level
+12. executed aggressive sell volume at bid level
+
+## Discrete action space
+
+```text
+0: do nothing
+1: quote both sides tight
+2: quote both sides normal
+3: quote both sides wide
+4: skew quotes to reduce long inventory
+5: skew quotes to reduce short inventory
+6: cancel all
+7: only bid
+8: only ask
+```
+
+## Development order
+
+1. Make data reconstruction boringly correct.
+2. Log enough replay data to debug every fill.
+3. Prove the fill simulator is conservative.
+4. Beat the hardcoded baseline.
+5. Only then bother flexing with RL.
+
+## Safety note
+
+This repository is for research, simulation, paper trading, and education. It is not financial advice and does not include live order placement.
