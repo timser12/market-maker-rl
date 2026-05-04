@@ -17,4 +17,4 @@ latency_max_ms: 250
 decision_interval_ms: 1000
 queue_ahead_fraction: "1.0"
 cancel_ahead_fraction: "0.25"
-trade_through_fill_fraction: "1.0"
+trade_through_fill_fraction: "0.5"

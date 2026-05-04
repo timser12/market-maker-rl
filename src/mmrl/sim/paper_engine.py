@@ -47,7 +47,7 @@ class PaperExecutionEngine:
             order = self.fill_model.new_order(Side.SELL, ask_price, p.ask_size_int, now_ms, self.book)
             self.open_orders[order.order_id] = order
 
-        def process_depth_update(self, event: dict, event_time_ms: int) -> None:
+    def process_depth_update(self, event: dict, event_time_ms: int) -> None:
             """Update order queue positions from depth changes.
 
             This must be called BEFORE the LocalOrderBook applies the depth event,
