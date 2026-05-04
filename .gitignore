@@ -1,12 +1,83 @@
-.venv/
+# Python cache
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test / coverage
 .pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
 .mypy_cache/
 .ruff_cache/
+.pyre/
+.hypothesis/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Environment files / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+
+# Local data
 data/raw/
-data/snapshots/
+data/processed/
+data/replays/
+*.jsonl
+*.parquet
+*.csv
+
+# Models / training artifacts
+models/
+checkpoints/
 runs/
+wandb/
+tensorboard/
 *.pt
 *.pth
-.env
+*.ckpt
+*.onnx
+
+# Binance / replay dumps
+events.jsonl
+*_replay.jsonl
+btcusdt_*.jsonl
+
+# Temporary files
+tmp/
+temp/
+.cache/
+
+# OS files
+desktop.ini

@@ -47,6 +47,20 @@ class PaperExecutionEngine:
             order = self.fill_model.new_order(Side.SELL, ask_price, p.ask_size_int, now_ms, self.book)
             self.open_orders[order.order_id] = order
 
+        def process_depth_update(self, event: dict, event_time_ms: int) -> None:
+            """Update order queue positions from depth changes.
+
+            This must be called BEFORE the LocalOrderBook applies the depth event,
+            because the fill model compares old visible quantity with new quantity.
+            """
+            for order in list(self.open_orders.values()):
+                self.fill_model.process_depth_update(
+                    order=order,
+                    event=event,
+                    book_before_update=self.book,
+                    event_time_ms=event_time_ms,
+                )
+
     def process_trade(self, trade: AggTrade) -> list[Fill]:
         fills: list[Fill] = []
         for order_id, order in list(self.open_orders.items()):

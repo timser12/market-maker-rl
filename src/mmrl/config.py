@@ -32,6 +32,10 @@ class BotConfig(BaseModel):
     base_order_size: Decimal = Decimal("0.001")
     latency_min_ms: PositiveInt = 50
     latency_max_ms: PositiveInt = 250
+    decision_interval_ms: PositiveInt = 1000
+    queue_ahead_fraction: Decimal = Decimal("1.0")
+    cancel_ahead_fraction: Decimal = Decimal("0.25")
+    trade_through_fill_fraction: Decimal = Decimal("1.0")
 
     @field_validator("symbol")
     @classmethod
@@ -43,6 +47,17 @@ class BotConfig(BaseModel):
     def positive_decimal(cls, value: Decimal) -> Decimal:
         if value <= 0:
             raise ValueError("must be positive")
+        return value
+    
+    @field_validator(
+        "queue_ahead_fraction",
+        "cancel_ahead_fraction",
+        "trade_through_fill_fraction",
+    )
+    @classmethod
+    def fraction_between_zero_and_one(cls, value: Decimal) -> Decimal:
+        if value < 0 or value > 1:
+            raise ValueError("must be between 0 and 1")
         return value
 
     @classmethod

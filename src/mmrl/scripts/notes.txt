@@ -1,0 +1,49 @@
+python -m mmrl.scripts.collect_data --config configs/default.yaml --out data/raw/btcusdt_250k.jsonl --max-events 250000
+
+python -m mmrl.scripts.validate_replay --config configs/default.yaml --replay data/raw/btcusdt_250k.jsonl
+python -m mmrl.scripts.run_env_smoke --config configs/default.yaml --replay data/raw/btcusdt_250k.jsonl
+python -m mmrl.scripts.train_dqn --config configs/default.yaml --replay data/raw/btcusdt_250k.jsonl --episodes 3 --max-steps 50000 --out models/dqn_demo.pt
+
+python -m mmrl.scripts.train_dqn `
+  --config configs/default.yaml `
+  --replay data/raw/btcusdt_250k.jsonl `
+  --episodes 3 `
+  --max-steps 50000 `
+  --out models/dqn_demo.pt `
+  --run-name class_demo_dqn `
+  --device-name cuda `
+  --log-every 500 `
+  --checkpoint-every-steps 5000 `
+  --eval-every-episodes 1 `
+  --max-eval-steps 10000
+
+python -m mmrl.scripts.audit_fills_plain --config configs/default.yaml --replay data/raw/events.jsonl --action 1 --max-steps 2000
+
+====> NEW 
+
+python -m mmrl.scripts.collect_data `
+  --config configs/default.yaml `
+  --out data/raw/btcusdt_250k.jsonl `
+  --max-events 250000
+
+  python -m mmrl.scripts.split_replay `
+  --config configs/default.yaml `
+  --in-replay data/raw/btcusdt_250k.jsonl `
+  --train-out data/raw/btcusdt_train.jsonl `
+  --eval-out data/raw/btcusdt_eval.jsonl `
+  --train-frac 0.8
+
+  python -m mmrl.scripts.train_dqn `
+  --config configs/default.yaml `
+  --replay data/raw/btcusdt_train.jsonl `
+  --episodes 30 `
+  --max-steps 50000 `
+  --out models/dqn_demo.pt `
+  --run-name class_demo_dqn_big `
+  --device-name cuda `
+  --log-every 5000 `
+  --checkpoint-every-steps 5000 `
+  --eval-every-episodes 9999 `
+  --epsilon-start 1.0 `
+  --epsilon-end 0.10 `
+  --epsilon-decay-steps 250000
