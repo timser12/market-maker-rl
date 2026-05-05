@@ -41,10 +41,23 @@ def load_checkpoint(path: Path, device: torch.device) -> dict[str, Any]:
         return torch.load(path, map_location=device)
 
 
+def clean_array(array: np.ndarray, dtype: np.dtype | type = np.float32) -> np.ndarray:
+    return np.nan_to_num(array, nan=0.0, posinf=10.0, neginf=-10.0).astype(dtype, copy=False)
+
+
+def clean_obs(obs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    return {
+        "order_book": clean_array(obs["order_book"], np.float32),
+        "portfolio": clean_array(obs["portfolio"], np.float32),
+    }
+
+
 def obs_to_tensors(obs: dict[str, np.ndarray], device: torch.device):
-    book = torch.from_numpy(obs["order_book"]).unsqueeze(0).float().to(device)
-    portfolio = torch.from_numpy(obs["portfolio"]).unsqueeze(0).float().to(device)
+    obs = clean_obs(obs)
+    book = torch.from_numpy(np.ascontiguousarray(obs["order_book"])).unsqueeze(0).float().to(device)
+    portfolio = torch.from_numpy(np.ascontiguousarray(obs["portfolio"])).unsqueeze(0).float().to(device)
     return book, portfolio
+
 
 def json_default(obj: Any):
     if isinstance(obj, np.integer):
@@ -64,14 +77,19 @@ def json_default(obj: Any):
 
     return str(obj)
 
+
 def reward_to_dict(reward_breakdown: Any) -> dict[str, float]:
     if reward_breakdown is None:
         return {
             "equity_delta": 0.0,
             "equity_delta_scaled": 0.0,
+            "equity_change": 0.0,
+            "spread_capture": 0.0,
             "inventory_penalty": 0.0,
             "inventory_change_penalty": 0.0,
+            "adverse_selection_penalty": 0.0,
             "drawdown_penalty": 0.0,
+            "fee_penalty": 0.0,
             "risk_override_penalty": 0.0,
             "cancel_penalty": 0.0,
             "current_equity": 0.0,
@@ -83,17 +101,39 @@ def reward_to_dict(reward_breakdown: Any) -> dict[str, float]:
     return {
         "equity_delta": float(getattr(reward_breakdown, "equity_delta", 0.0)),
         "equity_delta_scaled": float(getattr(reward_breakdown, "equity_delta_scaled", 0.0)),
+        "equity_change": float(getattr(reward_breakdown, "equity_change", 0.0)),
+        "spread_capture": float(getattr(reward_breakdown, "spread_capture", 0.0)),
         "inventory_penalty": float(getattr(reward_breakdown, "inventory_penalty", 0.0)),
         "inventory_change_penalty": float(
             getattr(reward_breakdown, "inventory_change_penalty", 0.0)
         ),
+        "adverse_selection_penalty": float(
+            getattr(reward_breakdown, "adverse_selection_penalty", 0.0)
+        ),
         "drawdown_penalty": float(getattr(reward_breakdown, "drawdown_penalty", 0.0)),
+        "fee_penalty": float(getattr(reward_breakdown, "fee_penalty", 0.0)),
         "risk_override_penalty": float(getattr(reward_breakdown, "risk_override_penalty", 0.0)),
         "cancel_penalty": float(getattr(reward_breakdown, "cancel_penalty", 0.0)),
         "current_equity": float(getattr(reward_breakdown, "current_equity", 0.0)),
         "previous_equity": float(getattr(reward_breakdown, "previous_equity", 0.0)),
         "inventory_ratio": float(getattr(reward_breakdown, "inventory_ratio", 0.0)),
         "drawdown_scaled": float(getattr(reward_breakdown, "drawdown_scaled", 0.0)),
+    }
+
+
+def account_stats(env: MarketMakingEnv) -> dict[str, float]:
+    """
+    obs['portfolio'] is now the 18-feature auxiliary vector.
+    Raw account values must come from env.engine.
+    """
+    mid = env.engine.current_mid_decimal()
+    portfolio = env.engine.portfolio
+
+    return {
+        "inventory": float(portfolio.inventory),
+        "cash": float(portfolio.cash),
+        "equity": float(portfolio.equity(mid)),
+        "unrealized": float(portfolio.unrealized_pnl(mid)),
     }
 
 
@@ -106,6 +146,8 @@ def print_summary(summary: dict[str, Any]) -> None:
         "model",
         "replay",
         "device",
+        "portfolio_dim",
+        "book_channels",
         "steps",
         "total_reward",
         "avg_reward",
@@ -166,14 +208,54 @@ def main(
         device = torch.device(device_name)
 
     checkpoint = load_checkpoint(model, device)
-    n_actions = int(checkpoint.get("n_actions", 9))
-
-    policy = DuelingDQN(book_channels=12, portfolio_dim=4, n_actions=n_actions).to(device)
-    policy.load_state_dict(checkpoint["model_state_dict"])
-    policy.eval()
 
     env = MarketMakingEnv(cfg, snapshot, events)
     obs, _ = env.reset()
+    obs = clean_obs(obs)
+
+    env_n_actions = int(env.action_space.n)
+    checkpoint_n_actions = int(checkpoint.get("n_actions", env_n_actions))
+
+    if checkpoint_n_actions != env_n_actions:
+        raise RuntimeError(
+            f"Checkpoint n_actions={checkpoint_n_actions} does not match "
+            f"env n_actions={env_n_actions}"
+        )
+
+    book_channels = int(obs["order_book"].shape[0])
+    portfolio_dim = int(obs["portfolio"].shape[0])
+
+    checkpoint_portfolio_dim = checkpoint.get("portfolio_dim")
+    checkpoint_book_channels = checkpoint.get("book_channels")
+
+    if checkpoint_portfolio_dim is not None and int(checkpoint_portfolio_dim) != portfolio_dim:
+        raise RuntimeError(
+            f"Checkpoint portfolio_dim={checkpoint_portfolio_dim} does not match "
+            f"env portfolio_dim={portfolio_dim}. Old models trained with portfolio_dim=4 "
+            "cannot be evaluated after the aux-state upgrade. Train a new model."
+        )
+
+    if checkpoint_book_channels is not None and int(checkpoint_book_channels) != book_channels:
+        raise RuntimeError(
+            f"Checkpoint book_channels={checkpoint_book_channels} does not match "
+            f"env book_channels={book_channels}"
+        )
+
+    policy = DuelingDQN(
+        book_channels=book_channels,
+        portfolio_dim=portfolio_dim,
+        n_actions=env_n_actions,
+    ).to(device)
+
+    try:
+        policy.load_state_dict(checkpoint["model_state_dict"])
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Could not load checkpoint into current DQN architecture. If this model was "
+            "trained before the auxiliary-state upgrade, train a new model."
+        ) from exc
+
+    policy.eval()
 
     total_reward = 0.0
     action_counts: Counter[int] = Counter()
@@ -187,6 +269,24 @@ def main(
 
     step_writer = None
     step_file = None
+
+    reward_fields = [
+        "equity_delta",
+        "equity_delta_scaled",
+        "equity_change",
+        "spread_capture",
+        "inventory_penalty",
+        "inventory_change_penalty",
+        "adverse_selection_penalty",
+        "drawdown_penalty",
+        "fee_penalty",
+        "risk_override_penalty",
+        "cancel_penalty",
+        "current_equity",
+        "previous_equity",
+        "inventory_ratio",
+        "drawdown_scaled",
+    ]
 
     if step_log is not None:
         step_log.parent.mkdir(parents=True, exist_ok=True)
@@ -207,17 +307,7 @@ def main(
                 "open_orders",
                 "fills",
                 "risk_reason",
-                "equity_delta",
-                "equity_delta_scaled",
-                "inventory_penalty",
-                "inventory_change_penalty",
-                "drawdown_penalty",
-                "risk_override_penalty",
-                "cancel_penalty",
-                "current_equity",
-                "previous_equity",
-                "inventory_ratio",
-                "drawdown_scaled",
+                *reward_fields,
             ],
         )
         step_writer.writeheader()
@@ -227,11 +317,16 @@ def main(
             with torch.no_grad():
                 book, portfolio = obs_to_tensors(obs, device)
                 q_values = policy(book, portfolio)
+
+                if not torch.isfinite(q_values).all():
+                    raise RuntimeError(f"Non-finite Q-values detected: {q_values}")
+
                 action = int(q_values.argmax(dim=1).item())
                 q_max = float(q_values.max().item())
                 q_min = float(q_values.min().item())
 
             next_obs, reward, terminated, truncated, info = env.step(action)
+            next_obs = clean_obs(next_obs)
             done = bool(terminated or truncated)
 
             total_reward += float(reward)
@@ -241,14 +336,14 @@ def main(
             if risk_reason:
                 risk_counts[str(risk_reason)] += 1
 
-            fills = len(env.engine.last_fills)
+            fills = int(info.get("fills", len(env.engine.last_fills)))
             total_fills += fills
 
-            portfolio_vec = next_obs["portfolio"]
-            inventory = float(portfolio_vec[0])
-            max_abs_inventory = max(max_abs_inventory, abs(inventory))
+            stats = account_stats(env)
+            max_abs_inventory = max(max_abs_inventory, abs(stats["inventory"]))
 
             reward_parts = reward_to_dict(info.get("reward_breakdown"))
+
             for key, value in reward_parts.items():
                 reward_component_sums[key] += float(value)
 
@@ -261,10 +356,10 @@ def main(
                         "reward": float(reward),
                         "q_max": q_max,
                         "q_min": q_min,
-                        "inventory": float(portfolio_vec[0]),
-                        "cash": float(portfolio_vec[1]),
-                        "equity": float(portfolio_vec[2]),
-                        "unrealized": float(portfolio_vec[3]),
+                        "inventory": stats["inventory"],
+                        "cash": stats["cash"],
+                        "equity": stats["equity"],
+                        "unrealized": stats["unrealized"],
                         "open_orders": len(env.engine.open_orders),
                         "fills": fills,
                         "risk_reason": risk_reason,
@@ -279,7 +374,7 @@ def main(
         if step_file is not None:
             step_file.close()
 
-    final_portfolio = obs["portfolio"]
+    stats = account_stats(env)
 
     summary = {
         "model": str(model),
@@ -287,13 +382,18 @@ def main(
         "config": str(config),
         "device": str(device),
         "replay_counts": replay_counts,
+        "n_actions": env_n_actions,
+        "portfolio_dim": portfolio_dim,
+        "book_channels": book_channels,
+        "checkpoint_portfolio_dim": checkpoint.get("portfolio_dim"),
+        "checkpoint_book_channels": checkpoint.get("book_channels"),
         "steps": steps,
         "total_reward": total_reward,
         "avg_reward": total_reward / max(1, steps),
-        "final_inventory": float(final_portfolio[0]),
-        "final_cash": float(final_portfolio[1]),
-        "final_equity": float(final_portfolio[2]),
-        "final_unrealized": float(final_portfolio[3]),
+        "final_inventory": stats["inventory"],
+        "final_cash": stats["cash"],
+        "final_equity": stats["equity"],
+        "final_unrealized": stats["unrealized"],
         "max_abs_inventory": max_abs_inventory,
         "total_fills": total_fills,
         "risk_override_count": sum(risk_counts.values()),
@@ -302,13 +402,14 @@ def main(
         "reward_component_sums": dict(reward_component_sums),
         "checkpoint_global_step": checkpoint.get("global_step"),
         "checkpoint_episode": checkpoint.get("episode"),
+        "checkpoint_extra": checkpoint.get("extra"),
     }
 
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(
-    json.dumps(summary, indent=2, default=json_default),
-    encoding="utf-8",
-)
+        json.dumps(summary, indent=2, default=json_default),
+        encoding="utf-8",
+    )
 
     print_summary(summary)
 

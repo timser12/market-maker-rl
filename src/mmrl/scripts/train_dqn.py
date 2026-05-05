@@ -49,6 +49,17 @@ class Transition:
     done: bool
 
 
+def clean_array(array: np.ndarray, dtype: np.dtype | type = np.float32) -> np.ndarray:
+    return np.nan_to_num(array, nan=0.0, posinf=10.0, neginf=-10.0).astype(dtype, copy=False)
+
+
+def clean_obs(obs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    return {
+        "order_book": clean_array(obs["order_book"], np.float32),
+        "portfolio": clean_array(obs["portfolio"], np.float32),
+    }
+
+
 class ReplayBuffer:
     def __init__(self, capacity: int):
         self.data: deque[Transition] = deque(maxlen=capacity)
@@ -57,6 +68,9 @@ class ReplayBuffer:
         return len(self.data)
 
     def push(self, obs, action: int, reward: float, next_obs, done: bool) -> None:
+        obs = clean_obs(obs)
+        next_obs = clean_obs(next_obs)
+
         self.data.append(
             Transition(
                 book=obs["order_book"].astype(np.float16, copy=True),
@@ -93,8 +107,9 @@ class CsvLogger:
 
 
 def obs_to_tensors(obs: dict[str, np.ndarray], device: torch.device):
-    book = torch.from_numpy(obs["order_book"]).unsqueeze(0).float().to(device)
-    portfolio = torch.from_numpy(obs["portfolio"]).unsqueeze(0).float().to(device)
+    obs = clean_obs(obs)
+    book = torch.from_numpy(np.ascontiguousarray(obs["order_book"])).unsqueeze(0).float().to(device)
+    portfolio = torch.from_numpy(np.ascontiguousarray(obs["portfolio"])).unsqueeze(0).float().to(device)
     return book, portfolio
 
 
@@ -116,16 +131,25 @@ def choose_action(
     n_actions: int,
     device: torch.device,
 ) -> tuple[int, float, float]:
-    if random.random() < epsilon:
-        return random.randrange(n_actions), float("nan"), float("nan")
-
+    """
+    Always compute Q-values for logging, even when epsilon chooses a random action.
+    No more ugly q_max=nan unless the network is genuinely broken.
+    """
     with torch.no_grad():
         book, portfolio = obs_to_tensors(obs, device)
         q_values = policy(book, portfolio)
-        action = int(q_values.argmax(dim=1).item())
+
+        if not torch.isfinite(q_values).all():
+            raise RuntimeError(f"Non-finite Q-values detected: {q_values}")
+
+        greedy_action = int(q_values.argmax(dim=1).item())
         q_max = float(q_values.max().item())
         q_min = float(q_values.min().item())
-        return action, q_max, q_min
+
+    if random.random() < epsilon:
+        return random.randrange(n_actions), q_max, q_min
+
+    return greedy_action, q_max, q_min
 
 
 def optimize(
@@ -145,11 +169,21 @@ def optimize(
         batch, device
     )
 
-    q = policy(books, portfolios).gather(1, actions)
+    q_all = policy(books, portfolios)
+    if not torch.isfinite(q_all).all():
+        raise RuntimeError("Non-finite policy Q-values during optimization")
+
+    q = q_all.gather(1, actions)
 
     with torch.no_grad():
-        next_actions = policy(next_books, next_portfolios).argmax(dim=1, keepdim=True)
-        next_q = target(next_books, next_portfolios).gather(1, next_actions)
+        next_policy_q = policy(next_books, next_portfolios)
+        next_target_q_all = target(next_books, next_portfolios)
+
+        if not torch.isfinite(next_policy_q).all() or not torch.isfinite(next_target_q_all).all():
+            raise RuntimeError("Non-finite next Q-values during optimization")
+
+        next_actions = next_policy_q.argmax(dim=1, keepdim=True)
+        next_q = next_target_q_all.gather(1, next_actions)
         target_q = rewards + gamma * (1.0 - dones) * next_q
 
     loss = nn.functional.smooth_l1_loss(q, target_q)
@@ -166,11 +200,8 @@ def optimize(
         "grad_norm": grad_norm,
     }
 
+
 def json_default(obj: Any):
-    """
-    Convert NumPy / Path / Torch-ish objects into normal JSON values.
-    Because json.dumps does not care about your feelings or your numpy.int64.
-    """
     if isinstance(obj, np.integer):
         return int(obj)
 
@@ -188,32 +219,47 @@ def json_default(obj: Any):
 
     return str(obj)
 
+
 def reward_to_dict(reward_breakdown: Any) -> dict[str, float]:
+    """
+    Supports both your newer reward object names and the older scaffold names.
+    This avoids CSV/logging crashes while you keep iterating on reward.py.
+    """
+    defaults = {
+        "reward_equity_delta": 0.0,
+        "reward_equity_delta_scaled": 0.0,
+        "reward_equity_change": 0.0,
+        "reward_spread_capture": 0.0,
+        "reward_inventory_penalty": 0.0,
+        "reward_inventory_change_penalty": 0.0,
+        "reward_adverse_selection_penalty": 0.0,
+        "reward_drawdown_penalty": 0.0,
+        "reward_fee_penalty": 0.0,
+        "reward_risk_override_penalty": 0.0,
+        "reward_cancel_penalty": 0.0,
+        "reward_current_equity": 0.0,
+        "reward_previous_equity": 0.0,
+        "reward_inventory_ratio": 0.0,
+        "reward_drawdown_scaled": 0.0,
+    }
+
     if reward_breakdown is None:
-        return {
-            "reward_equity_delta": 0.0,
-            "reward_equity_delta_scaled": 0.0,
-            "reward_inventory_penalty": 0.0,
-            "reward_inventory_change_penalty": 0.0,
-            "reward_drawdown_penalty": 0.0,
-            "reward_risk_override_penalty": 0.0,
-            "reward_cancel_penalty": 0.0,
-            "reward_current_equity": 0.0,
-            "reward_previous_equity": 0.0,
-            "reward_inventory_ratio": 0.0,
-            "reward_drawdown_scaled": 0.0,
-        }
+        return defaults
 
     return {
         "reward_equity_delta": float(getattr(reward_breakdown, "equity_delta", 0.0)),
-        "reward_equity_delta_scaled": float(
-            getattr(reward_breakdown, "equity_delta_scaled", 0.0)
-        ),
+        "reward_equity_delta_scaled": float(getattr(reward_breakdown, "equity_delta_scaled", 0.0)),
+        "reward_equity_change": float(getattr(reward_breakdown, "equity_change", 0.0)),
+        "reward_spread_capture": float(getattr(reward_breakdown, "spread_capture", 0.0)),
         "reward_inventory_penalty": float(getattr(reward_breakdown, "inventory_penalty", 0.0)),
         "reward_inventory_change_penalty": float(
             getattr(reward_breakdown, "inventory_change_penalty", 0.0)
         ),
+        "reward_adverse_selection_penalty": float(
+            getattr(reward_breakdown, "adverse_selection_penalty", 0.0)
+        ),
         "reward_drawdown_penalty": float(getattr(reward_breakdown, "drawdown_penalty", 0.0)),
+        "reward_fee_penalty": float(getattr(reward_breakdown, "fee_penalty", 0.0)),
         "reward_risk_override_penalty": float(
             getattr(reward_breakdown, "risk_override_penalty", 0.0)
         ),
@@ -225,6 +271,22 @@ def reward_to_dict(reward_breakdown: Any) -> dict[str, float]:
     }
 
 
+def account_stats(env: MarketMakingEnv) -> dict[str, float]:
+    """
+    Important: obs['portfolio'] is now the 18-feature auxiliary vector.
+    Do not read raw cash/equity from it. Pull true account state from env.engine.
+    """
+    mid = env.engine.current_mid_decimal()
+    portfolio = env.engine.portfolio
+
+    return {
+        "inventory": float(portfolio.inventory),
+        "cash": float(portfolio.cash),
+        "equity": float(portfolio.equity(mid)),
+        "unrealized": float(portfolio.unrealized_pnl(mid)),
+    }
+
+
 def save_checkpoint(
     path: Path,
     policy: DuelingDQN,
@@ -232,20 +294,25 @@ def save_checkpoint(
     cfg: BotConfig,
     replay: Path,
     n_actions: int,
+    portfolio_dim: int,
+    book_channels: int,
     global_step: int,
     episode: int,
     extra: dict[str, Any] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+
     torch.save(
         {
             "model_state_dict": policy.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "config": cfg.model_dump(mode="json"),
+            "portfolio_dim": int(portfolio_dim),
+            "book_channels": int(book_channels),
             "replay": str(replay),
-            "n_actions": n_actions,
-            "global_step": global_step,
-            "episode": episode,
+            "n_actions": int(n_actions),
+            "global_step": int(global_step),
+            "episode": int(episode),
             "extra": extra or {},
         },
         path,
@@ -269,6 +336,7 @@ def print_progress(row: dict[str, Any]) -> None:
         "cash",
         "equity",
         "open_orders",
+        "fills",
         "risk_reason",
         "action_name",
     ]
@@ -289,11 +357,13 @@ def run_greedy_eval(
 ) -> dict[str, Any]:
     env = MarketMakingEnv(cfg, snapshot, events)
     obs, _ = env.reset()
+    obs = clean_obs(obs)
 
     total_reward = 0.0
     action_counts: Counter[int] = Counter()
     risk_counts: Counter[str] = Counter()
     max_abs_inventory = 0.0
+    total_fills = 0
 
     policy.eval()
 
@@ -304,11 +374,14 @@ def run_greedy_eval(
         with torch.no_grad():
             book, portfolio = obs_to_tensors(obs, device)
             q_values = policy(book, portfolio)
+
+            if not torch.isfinite(q_values).all():
+                raise RuntimeError(f"Non-finite Q-values detected: {q_values}")
+
             action = int(q_values.argmax(dim=1).item())
-        if not torch.isfinite(q_values).all():
-            raise RuntimeError(f"Non-finite Q-values detected: {q_values}")
 
         next_obs, reward, terminated, truncated, info = env.step(action)
+        next_obs = clean_obs(next_obs)
         done = bool(terminated or truncated)
 
         total_reward += float(reward)
@@ -318,25 +391,27 @@ def run_greedy_eval(
         if risk_reason:
             risk_counts[str(risk_reason)] += 1
 
-        inventory = float(next_obs["portfolio"][0])
-        max_abs_inventory = max(max_abs_inventory, abs(inventory))
+        stats = account_stats(env)
+        max_abs_inventory = max(max_abs_inventory, abs(stats["inventory"]))
+        total_fills += int(info.get("fills", len(env.engine.last_fills)))
 
         obs = next_obs
         steps += 1
 
     policy.train()
 
-    final_portfolio = obs["portfolio"]
+    stats = account_stats(env)
 
     return {
         "eval_steps": steps,
         "eval_total_reward": total_reward,
         "eval_avg_reward": total_reward / max(1, steps),
-        "eval_final_inventory": float(final_portfolio[0]),
-        "eval_final_cash": float(final_portfolio[1]),
-        "eval_final_equity": float(final_portfolio[2]),
-        "eval_final_unrealized": float(final_portfolio[3]),
+        "eval_final_inventory": stats["inventory"],
+        "eval_final_cash": stats["cash"],
+        "eval_final_equity": stats["equity"],
+        "eval_final_unrealized": stats["unrealized"],
         "eval_max_abs_inventory": max_abs_inventory,
+        "eval_total_fills": total_fills,
         "eval_action_counts": dict(action_counts),
         "eval_risk_counts": dict(risk_counts),
     }
@@ -358,7 +433,7 @@ def main(
     lr: float = typer.Option(1e-4),
     target_update_steps: int = typer.Option(1_000),
     checkpoint_every_steps: int = typer.Option(5_000),
-    log_every: int = typer.Option(500),
+    log_every: int = typer.Option(5000),
     eval_every_episodes: int = typer.Option(1),
     max_eval_steps: int = typer.Option(10_000),
     epsilon_start: float = typer.Option(1.0),
@@ -427,9 +502,13 @@ def main(
             "risk_reason",
             "reward_equity_delta",
             "reward_equity_delta_scaled",
+            "reward_equity_change",
+            "reward_spread_capture",
             "reward_inventory_penalty",
             "reward_inventory_change_penalty",
+            "reward_adverse_selection_penalty",
             "reward_drawdown_penalty",
+            "reward_fee_penalty",
             "reward_risk_override_penalty",
             "reward_cancel_penalty",
             "reward_current_equity",
@@ -470,16 +549,32 @@ def main(
             "eval_final_equity",
             "eval_final_unrealized",
             "eval_max_abs_inventory",
+            "eval_total_fills",
             "eval_action_counts_json",
             "eval_risk_counts_json",
         ],
     )
 
     env = MarketMakingEnv(cfg, snapshot, events)
-    n_actions = env.action_space.n
+    initial_obs, _ = env.reset()
+    initial_obs = clean_obs(initial_obs)
 
-    policy = DuelingDQN(book_channels=12, portfolio_dim=4, n_actions=n_actions).to(device)
-    target = DuelingDQN(book_channels=12, portfolio_dim=4, n_actions=n_actions).to(device)
+    n_actions = int(env.action_space.n)
+    portfolio_dim = int(initial_obs["portfolio"].shape[0])
+    book_channels = int(initial_obs["order_book"].shape[0])
+
+    policy = DuelingDQN(
+        book_channels=book_channels,
+        portfolio_dim=portfolio_dim,
+        n_actions=n_actions,
+    ).to(device)
+
+    target = DuelingDQN(
+        book_channels=book_channels,
+        portfolio_dim=portfolio_dim,
+        n_actions=n_actions,
+    ).to(device)
+
     target.load_state_dict(policy.state_dict())
     target.eval()
 
@@ -495,17 +590,23 @@ def main(
         "events_loaded_for_env": len(events),
         "device": str(device),
         "n_actions": n_actions,
+        "portfolio_dim": portfolio_dim,
+        "book_channels": book_channels,
         "episodes": episodes,
         "max_steps": max_steps,
+        "replay_capacity": replay_capacity,
         "batch_size": batch_size,
+        "learning_starts": learning_starts,
+        "train_every_steps": train_every_steps,
         "gamma": gamma,
         "lr": lr,
     }
 
+    run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "metadata.json").write_text(
-    json.dumps(metadata, indent=2, default=json_default),
-    encoding="utf-8",
-)
+        json.dumps(metadata, indent=2, default=json_default),
+        encoding="utf-8",
+    )
 
     console.print(metadata)
 
@@ -516,6 +617,7 @@ def main(
     try:
         for ep in range(1, episodes + 1):
             obs, _ = env.reset(seed=seed + ep)
+            obs = clean_obs(obs)
 
             episode_reward = 0.0
             episode_action_counts: Counter[int] = Counter()
@@ -523,14 +625,15 @@ def main(
 
             steps = 0
             done = False
-            last_info: dict[str, Any] = {}
 
             while not done and steps < max_steps:
                 decay = min(1.0, global_step / max(1, epsilon_decay_steps))
                 epsilon = epsilon_start + decay * (epsilon_end - epsilon_start)
 
                 action, q_max, q_min = choose_action(policy, obs, epsilon, n_actions, device)
+
                 next_obs, reward, terminated, truncated, info = env.step(action)
+                next_obs = clean_obs(next_obs)
                 done = bool(terminated or truncated)
 
                 memory.push(obs, action, reward, next_obs, done)
@@ -571,7 +674,7 @@ def main(
                 if risk_reason:
                     episode_risk_counts[str(risk_reason)] += 1
 
-                portfolio_vec = next_obs["portfolio"]
+                stats = account_stats(env)
                 reward_parts = reward_to_dict(info.get("reward_breakdown"))
 
                 row = {
@@ -589,12 +692,12 @@ def main(
                     "grad_norm": opt_stats["grad_norm"],
                     "q_max": q_max,
                     "q_min": q_min,
-                    "inventory": float(portfolio_vec[0]),
-                    "cash": float(portfolio_vec[1]),
-                    "equity": float(portfolio_vec[2]),
-                    "unrealized": float(portfolio_vec[3]),
+                    "inventory": stats["inventory"],
+                    "cash": stats["cash"],
+                    "equity": stats["equity"],
+                    "unrealized": stats["unrealized"],
                     "open_orders": len(env.engine.open_orders),
-                    "fills": len(env.engine.last_fills),
+                    "fills": int(info.get("fills", len(env.engine.last_fills))),
                     "risk_reason": risk_reason,
                     **reward_parts,
                 }
@@ -616,17 +719,19 @@ def main(
                         cfg,
                         replay,
                         n_actions,
+                        portfolio_dim,
+                        book_channels,
                         global_step,
                         ep,
+                        extra={"run_dir": str(run_dir)},
                     )
                     console.print(f"[cyan]Saved checkpoint: {ckpt_path}[/cyan]")
 
                 obs = next_obs
                 steps += 1
                 global_step += 1
-                last_info = info
 
-            final_portfolio = obs["portfolio"]
+            stats = account_stats(env)
 
             episode_row = {
                 "episode": ep,
@@ -636,10 +741,10 @@ def main(
                 "epsilon": epsilon,
                 "buffer_size": len(memory),
                 "last_loss": last_loss,
-                "final_inventory": float(final_portfolio[0]),
-                "final_cash": float(final_portfolio[1]),
-                "final_equity": float(final_portfolio[2]),
-                "final_unrealized": float(final_portfolio[3]),
+                "final_inventory": stats["inventory"],
+                "final_cash": stats["cash"],
+                "final_equity": stats["equity"],
+                "final_unrealized": stats["unrealized"],
                 "action_counts_json": json.dumps(dict(episode_action_counts), default=json_default),
                 "risk_counts_json": json.dumps(dict(episode_risk_counts), default=json_default),
             }
@@ -661,13 +766,13 @@ def main(
                     "episode": ep,
                     **{k: v for k, v in eval_result.items() if not isinstance(v, dict)},
                     "eval_action_counts_json": json.dumps(
-    eval_result["eval_action_counts"],
-    default=json_default,
-),
-"eval_risk_counts_json": json.dumps(
-    eval_result["eval_risk_counts"],
-    default=json_default,
-),
+                        eval_result["eval_action_counts"],
+                        default=json_default,
+                    ),
+                    "eval_risk_counts_json": json.dumps(
+                        eval_result["eval_risk_counts"],
+                        default=json_default,
+                    ),
                 }
 
                 eval_logger.write(eval_row)
@@ -685,6 +790,8 @@ def main(
         cfg,
         replay,
         n_actions,
+        portfolio_dim,
+        book_channels,
         global_step,
         episodes,
         extra={"run_dir": str(run_dir)},
@@ -695,6 +802,8 @@ def main(
             "saved_model": str(out),
             "run_dir": str(run_dir),
             "global_step": global_step,
+            "portfolio_dim": portfolio_dim,
+            "book_channels": book_channels,
             "train_steps_csv": str(run_dir / "train_steps.csv"),
             "train_episodes_csv": str(run_dir / "train_episodes.csv"),
             "eval_episodes_csv": str(run_dir / "eval_episodes.csv"),

@@ -45,7 +45,7 @@ from mmrl.config import BotConfig
 from mmrl.data.order_book import BookSnapshot, LocalOrderBook, decimal_to_int
 from mmrl.data.trades import AggTrade
 from mmrl.env.actions import DiscreteActionMapper
-from mmrl.features.state_builder import ORDER_BOOK_CHANNELS, StateBuilder
+from mmrl.features.state_builder import AUX_FEATURE_DIM, ORDER_BOOK_CHANNELS, StateBuilder
 from mmrl.features.trade_buckets import TradeWindowAggregator
 from mmrl.sim.fill_model import ConservativeQueueFillModel
 from mmrl.sim.paper_engine import PaperExecutionEngine
@@ -127,7 +127,7 @@ class MarketMakingEnv(gym.Env):
                 "portfolio": spaces.Box(
                     low=-np.inf,
                     high=np.inf,
-                    shape=(4,),
+                    shape=(AUX_FEATURE_DIM,),
                     dtype=np.float32,
                 ),
             }
@@ -301,24 +301,25 @@ class MarketMakingEnv(gym.Env):
         return observation, reward.total, terminated, False, info
 
     def _observation(self) -> dict[str, np.ndarray]:
-        buckets = (
-            self.trade_agg.buckets(self.last_market_event_ms)
-            if self.last_market_event_ms
-            else {}
-        )
+        buckets = self.trade_agg.buckets(self.last_market_event_ms) if self.last_market_event_ms else {}
 
         frame = self.state_builder.build_order_book_frame(self.book, buckets)
         order_book_state = self.state_builder.push_frame(frame)
 
-        mid = self._mid_price_decimal()
-        portfolio_state = self.state_builder.portfolio_vector(
-            self.engine.portfolio,
-            mid,
+        mid = self.engine.current_mid_decimal()
+
+        portfolio_state = self.state_builder.aux_vector(
+            portfolio=self.engine.portfolio,
+            book=self.book,
+            mid_price=mid,
+            trade_buckets=buckets,
+            max_inventory=self.cfg.max_inventory,
+            open_orders=self.engine.open_orders,
         )
 
         return {
             "order_book": order_book_state.astype(np.float32),
-            "portfolio": portfolio_state,
+            "portfolio": portfolio_state.astype(np.float32),
         }
 
     def _mid_price_decimal(self) -> Decimal:
