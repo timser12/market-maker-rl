@@ -20,6 +20,7 @@ from mmrl.agents.networks import DuelingDQN
 from mmrl.config import BotConfig
 from mmrl.env.market_making_env import MarketMakingEnv
 from mmrl.scripts.replay_io import load_replay
+from mmrl.representation.market_encoder import FrozenEncoderDQN, load_pretrained_encoder
 
 app = typer.Typer(help="Train a logged discrete DQN prototype on an offline replay.")
 console = Console()
@@ -289,7 +290,7 @@ def account_stats(env: MarketMakingEnv) -> dict[str, float]:
 
 def save_checkpoint(
     path: Path,
-    policy: DuelingDQN,
+    policy: nn.Module,
     optimizer: torch.optim.Optimizer,
     cfg: BotConfig,
     replay: Path,
@@ -298,6 +299,8 @@ def save_checkpoint(
     book_channels: int,
     global_step: int,
     episode: int,
+    model_type: str = "dueling_dqn",
+    encoder_checkpoint: str | None = None,
     extra: dict[str, Any] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -313,6 +316,8 @@ def save_checkpoint(
             "n_actions": int(n_actions),
             "global_step": int(global_step),
             "episode": int(episode),
+            "model_type": model_type,
+            "encoder_checkpoint": encoder_checkpoint,
             "extra": extra or {},
         },
         path,
@@ -442,6 +447,10 @@ def main(
     seed: int = typer.Option(7),
     device_name: str = typer.Option("auto"),
     torch_threads: int = typer.Option(1),
+    encoder_checkpoint: Path | None = typer.Option(
+        None,
+        help="Optional pretrained market encoder checkpoint. If provided, train an MLP DQN head on frozen encoder embeddings.",
+    ),
 ) -> None:
     torch.set_num_threads(max(1, torch_threads))
 
@@ -563,17 +572,57 @@ def main(
     portfolio_dim = int(initial_obs["portfolio"].shape[0])
     book_channels = int(initial_obs["order_book"].shape[0])
 
-    policy = DuelingDQN(
-        book_channels=book_channels,
-        portfolio_dim=portfolio_dim,
-        n_actions=n_actions,
-    ).to(device)
+    if encoder_checkpoint is not None:
+        encoder, encoder_metadata = load_pretrained_encoder(encoder_checkpoint, device)
 
-    target = DuelingDQN(
-        book_channels=book_channels,
-        portfolio_dim=portfolio_dim,
-        n_actions=n_actions,
-    ).to(device)
+        expected_book_channels = int(encoder_metadata["book_channels"])
+        expected_aux_dim = int(encoder_metadata["aux_dim"])
+        embedding_dim = int(encoder_metadata["embedding_dim"])
+
+        if expected_book_channels != book_channels:
+            raise RuntimeError(
+                f"Encoder expects book_channels={expected_book_channels}, "
+                f"but env has book_channels={book_channels}"
+            )
+
+        if expected_aux_dim != portfolio_dim:
+            raise RuntimeError(
+                f"Encoder expects aux_dim={expected_aux_dim}, "
+                f"but env has portfolio_dim={portfolio_dim}"
+            )
+
+        policy = FrozenEncoderDQN(
+            encoder=encoder,
+            embedding_dim=embedding_dim,
+            n_actions=n_actions,
+            freeze_encoder=True,
+        ).to(device)
+
+        target_encoder, _ = load_pretrained_encoder(encoder_checkpoint, device)
+
+        target = FrozenEncoderDQN(
+            encoder=target_encoder,
+            embedding_dim=embedding_dim,
+            n_actions=n_actions,
+            freeze_encoder=True,
+        ).to(device)
+
+        model_type = "frozen_encoder_dqn"
+
+    else:
+        policy = DuelingDQN(
+            book_channels=book_channels,
+            portfolio_dim=portfolio_dim,
+            n_actions=n_actions,
+        ).to(device)
+
+        target = DuelingDQN(
+            book_channels=book_channels,
+            portfolio_dim=portfolio_dim,
+            n_actions=n_actions,
+        ).to(device)
+
+        model_type = "dueling_dqn"
 
     target.load_state_dict(policy.state_dict())
     target.eval()
@@ -724,6 +773,8 @@ def main(
                         global_step,
                         ep,
                         extra={"run_dir": str(run_dir)},
+                        model_type=model_type,
+                        encoder_checkpoint=None if encoder_checkpoint is None else str(encoder_checkpoint),
                     )
                     console.print(f"[cyan]Saved checkpoint: {ckpt_path}[/cyan]")
 
@@ -795,6 +846,8 @@ def main(
         global_step,
         episodes,
         extra={"run_dir": str(run_dir)},
+        model_type=model_type,
+        encoder_checkpoint=None if encoder_checkpoint is None else str(encoder_checkpoint),
     )
 
     console.print(
